@@ -211,7 +211,8 @@ class PercentileTracker:
             x = x.reshape(-1, x.size(-1))
         
         with torch.no_grad():
-            for c in range(self.num_channels):
+            actual_channels = min(self.num_channels, x.size(-1))
+            for c in range(actual_channels):
                 x_c = x[:, c].abs()
                 if x_c.numel() > 0:
                     # Calculate percentile
@@ -316,23 +317,27 @@ class Int4Quantizer(nn.Module):
         self.bits = 4
         self.L = 2 ** (self.bits - 1) - 1
         self.use_stochastic = use_stochastic
+        self.num_channels = num_channels
+        self.percentile = percentile
+        self.momentum = momentum
         
-        # Percentile tracker
-        self.tracker = PercentileTracker(num_channels, percentile, momentum)
-        # Move tracker buffers to module
-        self.register_buffer('percentile_vals', self.tracker.percentile_vals)
-        self.register_buffer('initialized', self.tracker.initialized)
-        self.tracker.percentile_vals = self.percentile_vals
-        self.tracker.initialized = self.initialized
+        # Register buffers directly
+        self.register_buffer('percentile_vals', torch.ones(num_channels))
+        self.register_buffer('initialized', torch.zeros(num_channels, dtype=torch.bool))
     
     def forward(self, x: torch.Tensor, training: bool = True) -> torch.Tensor:
         """Quantize activations to int4."""
+        # Ensure buffers are on correct device
+        if self.percentile_vals.device != x.device:
+            self.percentile_vals = self.percentile_vals.to(x.device)
+            self.initialized = self.initialized.to(x.device)
+        
         # Update percentile statistics
         if training:
-            self.tracker.update(x)
+            self.update_percentiles(x)
         
         # Get quantization scale
-        scale = self.tracker.get_scale(self.bits)
+        scale = self.percentile_vals / self.L
         scale = scale.view(1, 1, -1) if x.dim() == 3 else scale.view(1, -1)
         
         # Quantize
@@ -359,6 +364,31 @@ class Int4Quantizer(nn.Module):
             x_dequant = x + (x_dequant - x).detach()
         
         return x_dequant
+    
+    def update_percentiles(self, x: torch.Tensor):
+        """Update percentile statistics."""
+        # x shape: [B, S, C] or [B*S, C]
+        if x.dim() == 3:
+            x = x.reshape(-1, x.size(-1))
+        
+        with torch.no_grad():
+            actual_channels = min(self.num_channels, x.size(-1))
+            for c in range(actual_channels):
+                x_c = x[:, c].abs()
+                if x_c.numel() > 0:
+                    # Calculate percentile
+                    k = int(self.percentile * x_c.numel() / 100)
+                    k = max(1, min(k, x_c.numel() - 1))
+                    percentile_val = torch.kthvalue(x_c, k).values
+                    
+                    if not self.initialized[c]:
+                        self.percentile_vals[c] = percentile_val
+                        self.initialized[c] = True
+                    else:
+                        self.percentile_vals[c] = (
+                            self.momentum * self.percentile_vals[c] + 
+                            (1 - self.momentum) * percentile_val
+                        )
 
 
 # ============================================================================
@@ -389,6 +419,7 @@ class QDyTGroupNorm(nn.Module):
         self.register_buffer('calibrated', torch.tensor(False))
         
         self.warmup_steps = 0
+        self.alpha_init = alpha_init
         self.alpha_target = 0.5
         self.alpha_warmup_steps = 2000
     
@@ -492,9 +523,10 @@ class BitNetQDyTAttention(nn.Module):
             self.o_quantizer = TTQLSQTernaryQuantizer(self.hidden_size, self.hidden_size)
         
         # Activation quantizers (Q/K use higher precision)
-        self.q_act_quantizer = Int4Quantizer(self.hidden_size) if config.qk_bits <= 4 else None
-        self.k_act_quantizer = Int4Quantizer(self.hidden_size) if config.qk_bits <= 4 else None
-        self.v_act_quantizer = Int4Quantizer(self.hidden_size)
+        # Use head_dim for per-head quantization, not hidden_size
+        self.q_act_quantizer = Int4Quantizer(self.head_dim) if config.qk_bits <= 4 else None
+        self.k_act_quantizer = Int4Quantizer(self.head_dim) if config.qk_bits <= 4 else None
+        self.v_act_quantizer = Int4Quantizer(self.head_dim)
         self.o_act_quantizer = Int4Quantizer(self.hidden_size)
         
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
