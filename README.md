@@ -1,6 +1,6 @@
 **BitNet-QDyT: Ternary Transformer Encoders with Orthogonal Transforms and Quantization‑Aware Dynamic Tanh**
 
-**Authors** (Anonymous)
+**Authors** Jithin VG
 
 ---
 
@@ -80,16 +80,7 @@ We introduce a **matched‑compute ReLU²‑FFN** variant (also 8d→4d→d) to 
 * **Batching**: effective B=32 via accumulation to stabilize QDyT statistics.
 * **Baselines**: re‑trained FP32 BERT‑Base MLM to get PPL=18.9; 8‑bit Q‑BERT PPL=19.4; distilled ReLU²‑FFN (8×) PPL=19.8; TernaryBERT PPL=26.5 (re‑evaluated).
 
-### 4.2 Main Results (WikiText‑2)
 
-| Model                    | Bits (W/A) | Compute† | PPL ↓ | Size ↓ |
-| ------------------------ | ---------- | -------- | ----- | ------ |
-| BERT-Base (FP32)         | 32/32      | 1×       | 18.9  | 440 MB |
-| Q‑BERT                   | 8/8        | 0.6×\*   | 19.4  | 110 MB |
-| ReLU²‑FFN (8× expand)    | 32/4       | 1.1×     | 19.8  | 440 MB |
-| TernaryBERT              | 2/32       | 1×       | 26.5  | 65 MB  |
-| BitNet‑QDyT‑Base (ours)  | 1.58/4     | 0.7×     | 19.3  | 54 MB  |
-| BitNet‑QDyT‑Large (ours) | 1.58/4     | 0.8×     | 16.8  | 70 MB  |
 
 †Compute relative to BERT‑Base (FLOPs simulation). \*Q‑BERT uses int8 kernels.
 
@@ -99,15 +90,6 @@ We introduce a **matched‑compute ReLU²‑FFN** variant (also 8d→4d→d) to 
 2. **QDyT vs LayerNorm**: LayerNorm QAT (1.58+4-bit) → 23.1 PPL; static tanh→21.2; full QDyT→19.3.
 3. **STE type**: standard STE → 21.7; LSQ→19.7.
 4. **SwiGLU vs ReLU² (matched‑compute)**: ReLU² (8×)→19.8; SwiGLU→19.3.
-
-### 4.4 Downstream (GLUE)
-
-| Model            | MNLI | QQP  | QNLI | SST‑2 | Avg  |
-| ---------------- | ---- | ---- | ---- | ----- | ---- |
-| BERT‑Base (FP32) | 84.6 | 88.5 | 91.2 | 93.5  | 82.7 |
-| BitNet‑QDyT‑Base | 83.8 | 87.9 | 90.4 | 92.8  | 81.1 |
-
----
 
 ## 5. Discussion
 
