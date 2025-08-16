@@ -23,6 +23,9 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+import wandb
+import psutil
+import GPUtil
 
 # Import our modules
 from implementation import BitNetQDyTModel, ProgressiveQuantizationScheduler, QDropContext, calibrate_qdyt_norms
@@ -47,6 +50,9 @@ class Trainer:
         
         # Setup distributed training
         self.setup_distributed()
+        
+        # Initialize Weights & Biases
+        self.setup_wandb()
         
         # Setup directories
         self.setup_directories()
@@ -98,6 +104,73 @@ class Trainer:
             self.device = torch.device(f'cuda:{self.local_rank}')
             
             logger.info(f"Distributed training: rank {self.rank}/{self.world_size}")
+    
+    def setup_wandb(self):
+        """Initialize Weights & Biases tracking."""
+        if self.rank == 0 and not getattr(self.args, 'disable_wandb', False):  # Only initialize on main process
+            try:
+                # Create run name with timestamp and model size
+                run_name = self.args.wandb_run_name or f"bitnet-qdyt-{self.args.model_size}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # Try to initialize wandb with offline mode as fallback
+                mode = getattr(self.args, 'wandb_mode', 'online')
+                
+                wandb.init(
+                    project=self.args.wandb_project,
+                    name=run_name,
+                    tags=self.args.wandb_tags + [self.args.model_size, self.args.dataset],
+                    notes=self.args.wandb_notes,
+                    mode=mode,  # Can be 'online', 'offline', or 'disabled'
+                    config={
+                        "model_size": self.args.model_size,
+                        "dataset": self.args.dataset,
+                        "batch_size": self.args.batch_size,
+                        "learning_rate": self.args.learning_rate,
+                        "num_epochs": self.args.num_epochs,
+                        "warmup_steps": self.args.warmup_steps,
+                        "max_length": self.args.max_length,
+                        "fp16": self.args.fp16,
+                        "grad_clip": self.args.grad_clip,
+                        "weight_decay": self.args.weight_decay,
+                        "scheduler": self.args.scheduler,
+                        "mlm_probability": self.args.mlm_probability,
+                        "gradient_accumulation_steps": getattr(self.args, 'gradient_accumulation_steps', 1),
+                        "device": str(self.device),
+                        "world_size": self.world_size,
+                        "tokenizer": self.args.tokenizer,
+                        "log_interval": self.args.log_interval,
+                        "eval_interval": self.args.eval_interval,
+                        "save_interval": self.args.save_interval,
+                    }
+                )
+                self.wandb_run = wandb
+                logger.info(f"Initialized wandb run: {run_name} (mode: {mode})")
+                
+            except Exception as e:
+                logger.warning(f"Failed to initialize wandb: {e}")
+                logger.info("Falling back to offline mode...")
+                try:
+                    wandb.init(
+                        project=self.args.wandb_project,
+                        name=run_name,
+                        mode='offline',
+                        config={
+                            "model_size": self.args.model_size,
+                            "dataset": self.args.dataset,
+                            "batch_size": self.args.batch_size,
+                            "learning_rate": self.args.learning_rate,
+                        }
+                    )
+                    self.wandb_run = wandb
+                    logger.info(f"Initialized wandb run in offline mode: {run_name}")
+                except Exception as e2:
+                    logger.warning(f"Failed to initialize wandb in offline mode: {e2}")
+                    logger.info("Continuing without wandb logging")
+                    self.wandb_run = None
+        else:
+            self.wandb_run = None
+            if self.rank == 0:
+                logger.info("Wandb disabled or not main process")
     
     def setup_directories(self):
         """Create necessary directories."""
@@ -165,6 +238,25 @@ class Trainer:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         logger.info(f"Total parameters: {total_params:,}")
         logger.info(f"Trainable parameters: {trainable_params:,}")
+        
+        # Log model architecture to wandb
+        if self.rank == 0 and self.wandb_run:
+            # Update wandb config with model info
+            self.wandb_run.config.update({
+                'total_parameters': total_params,
+                'trainable_parameters': trainable_params,
+                'vocab_size': self.config.vocab_size,
+                'hidden_size': self.config.hidden_size,
+                'num_hidden_layers': self.config.num_hidden_layers,
+                'num_attention_heads': self.config.num_attention_heads,
+                'intermediate_size': self.config.intermediate_size,
+                'max_position_embeddings': self.config.max_position_embeddings,
+                'steps_per_epoch': self.steps_per_epoch,
+                'total_training_steps': self.total_steps,
+            })
+            
+            # Watch model for gradient tracking (optional, can be memory intensive)
+            # self.wandb_run.watch(self.model, log='all', log_freq=self.args.log_interval)
     
     def setup_optimization(self):
         """Setup optimizer, scheduler, and training utilities."""
@@ -247,6 +339,50 @@ class Trainer:
         
         # Loss function
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    
+    def get_system_metrics(self):
+        """Get system and GPU metrics for monitoring."""
+        metrics = {}
+        
+        # CPU metrics
+        metrics['cpu_percent'] = psutil.cpu_percent()
+        metrics['memory_percent'] = psutil.virtual_memory().percent
+        
+        # GPU metrics
+        if torch.cuda.is_available():
+            try:
+                gpu = GPUtil.getGPUs()[0] if GPUtil.getGPUs() else None
+                if gpu:
+                    metrics['gpu_utilization'] = gpu.load * 100
+                    metrics['gpu_memory_used'] = gpu.memoryUsed
+                    metrics['gpu_memory_total'] = gpu.memoryTotal
+                    metrics['gpu_memory_percent'] = (gpu.memoryUsed / gpu.memoryTotal) * 100
+                    metrics['gpu_temperature'] = gpu.temperature
+                
+                # PyTorch GPU memory
+                if torch.cuda.is_available():
+                    metrics['torch_gpu_memory_allocated'] = torch.cuda.memory_allocated() / 1024**3  # GB
+                    metrics['torch_gpu_memory_reserved'] = torch.cuda.memory_reserved() / 1024**3  # GB
+            except Exception as e:
+                logger.warning(f"Could not get GPU metrics: {e}")
+        
+        return metrics
+    
+    def log_metrics(self, metrics_dict, step, prefix=""):
+        """Log metrics to both wandb and tensorboard."""
+        if self.rank == 0:
+            # Add prefix to metric names
+            prefixed_metrics = {f"{prefix}{k}" if prefix else k: v for k, v in metrics_dict.items()}
+            
+            # Log to wandb
+            if self.wandb_run:
+                self.wandb_run.log(prefixed_metrics, step=step)
+            
+            # Log to tensorboard
+            if self.writer:
+                for key, value in prefixed_metrics.items():
+                    if isinstance(value, (int, float)):
+                        self.writer.add_scalar(key, value, step)
     
     def setup_logging(self):
         """Setup TensorBoard and logging."""
@@ -360,10 +496,34 @@ class Trainer:
                 })
             
             # Logging
-            if self.global_step % self.args.log_interval == 0 and self.writer:
-                self.writer.add_scalar('train/loss', loss.item(), self.global_step)
-                self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.global_step)
-                self.writer.add_scalar('train/qdrop_prob', qdrop_prob, self.global_step)
+            if self.global_step % self.args.log_interval == 0:
+                # Get system metrics
+                system_metrics = self.get_system_metrics()
+                
+                # Prepare training metrics
+                train_metrics = {
+                    'train/loss': loss.item(),
+                    'train/learning_rate': self.scheduler.get_last_lr()[0],
+                    'train/qdrop_probability': qdrop_prob,
+                    'train/training_stage': stage,
+                    'train/epoch': self.epoch,
+                    'train/global_step': self.global_step,
+                }
+                
+                # Add gradient norms
+                if hasattr(self, 'model'):
+                    total_norm = 0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    train_metrics['train/grad_norm'] = total_norm ** (1. / 2)
+                
+                # Combine all metrics
+                all_metrics = {**train_metrics, **system_metrics}
+                
+                # Log to wandb and tensorboard
+                self.log_metrics(all_metrics, self.global_step)
             
             # Validation
             if self.global_step % self.args.eval_interval == 0:
@@ -416,9 +576,14 @@ class Trainer:
         avg_loss = total_loss / total_steps
         perplexity = np.exp(avg_loss)
         
-        if self.writer:
-            self.writer.add_scalar('val/loss', avg_loss, self.global_step)
-            self.writer.add_scalar('val/perplexity', perplexity, self.global_step)
+        # Prepare validation metrics
+        val_metrics = {
+            'val/loss': avg_loss,
+            'val/perplexity': perplexity,
+        }
+        
+        # Log validation metrics
+        self.log_metrics(val_metrics, self.global_step)
         
         logger.info(f"Validation - Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}")
         
@@ -518,6 +683,11 @@ class Trainer:
         if self.writer:
             self.writer.close()
         
+        # Close wandb run
+        if self.wandb_run and self.rank == 0:
+            self.wandb_run.finish()
+            logger.info("Wandb run finished")
+        
         logger.info("Training complete!")
 
 
@@ -580,6 +750,21 @@ def main():
     # Resume training
     parser.add_argument('--resume_from', type=str, default=None,
                       help='Resume from checkpoint')
+    
+    # Wandb arguments
+    parser.add_argument('--wandb_project', type=str, default='bitnet-qdyt-v2',
+                      help='Wandb project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                      help='Wandb run name (auto-generated if not provided)')
+    parser.add_argument('--wandb_tags', type=str, nargs='*', default=[],
+                      help='Wandb tags for the run')
+    parser.add_argument('--wandb_notes', type=str, default=None,
+                      help='Notes for the wandb run')
+    parser.add_argument('--disable_wandb', action='store_true',
+                      help='Disable wandb logging')
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                      choices=['online', 'offline', 'disabled'],
+                      help='Wandb mode (online, offline, or disabled)')
     
     args = parser.parse_args()
     
